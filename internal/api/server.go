@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -59,6 +60,14 @@ type Server struct {
 	log      *slog.Logger
 	limiter  *RateLimiter
 	bcast    *broadcast.Broadcaster
+
+	// cachedLatestLedger caches the latest ledger from RPC health check
+	// to avoid hammering the RPC on every /stats request.
+	cachedLatestLedger struct {
+		mu        sync.RWMutex
+		ledger    int64
+		expiresAt time.Time
+	}
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -103,6 +112,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
+	r.Get("/metrics", s.handleMetrics)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
@@ -132,4 +142,88 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"remote", r.RemoteAddr,
 		)
 	})
+}
+
+// getCachedLatestLedger returns the cached latest ledger from RPC health check,
+// fetching a fresh value if the cache has expired (TTL: 5 seconds).
+func (s *Server) getCachedLatestLedger(ctx context.Context) (int64, error) {
+	s.cachedLatestLedger.mu.RLock()
+	if time.Now().Before(s.cachedLatestLedger.expiresAt) && s.cachedLatestLedger.ledger > 0 {
+		ledger := s.cachedLatestLedger.ledger
+		s.cachedLatestLedger.mu.RUnlock()
+		return ledger, nil
+	}
+	s.cachedLatestLedger.mu.RUnlock()
+
+	// Cache miss or expired - fetch fresh value
+	s.cachedLatestLedger.mu.Lock()
+	defer s.cachedLatestLedger.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if time.Now().Before(s.cachedLatestLedger.expiresAt) && s.cachedLatestLedger.ledger > 0 {
+		return s.cachedLatestLedger.ledger, nil
+	}
+
+	if s.rpc == nil {
+		return 0, nil
+	}
+
+	health, err := s.rpc.GetHealth(ctx)
+	if err != nil {
+		// Return stale value if available, otherwise error
+		if s.cachedLatestLedger.ledger > 0 {
+			return s.cachedLatestLedger.ledger, nil
+		}
+		return 0, err
+	}
+
+	ledger := int64(health.LatestLedger)
+	s.cachedLatestLedger.ledger = ledger
+	s.cachedLatestLedger.expiresAt = time.Now().Add(5 * time.Second)
+	return ledger, nil
+}
+
+// handleMetrics exposes Prometheus metrics including ingestion lag.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.Stats(r.Context())
+	if err != nil {
+		s.log.Error("loading stats for metrics", "error", err)
+		http.Error(w, "loading stats failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Get latest ledger from cache/RPC to compute lag
+	head, err := s.getCachedLatestLedger(r.Context())
+	if err != nil {
+		s.log.Warn("loading latest ledger for metrics", "error", err)
+		// Still emit stats without lag if we have last ingested
+		if stats.LastIngestedLedger > 0 {
+			head = stats.LastIngestedLedger // lag will be 0
+		} else {
+			http.Error(w, "loading latest ledger failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, "# HELP sorotrail_ingest_lag_ledgers Ingestion lag in ledgers (chain_head - last_ingested)\n")
+	fmt.Fprintf(w, "# TYPE sorotrail_ingest_lag_ledgers gauge\n")
+	fmt.Fprintf(w, "sorotrail_ingest_lag_ledgers %d\n", lag)
+	fmt.Fprintf(w, "# HELP sorotrail_last_ingested_ledger Last ingested ledger sequence\n")
+	fmt.Fprintf(w, "# TYPE sorotrail_last_ingested_ledger gauge\n")
+	fmt.Fprintf(w, "sorotrail_last_ingested_ledger %d\n", stats.LastIngestedLedger)
+	fmt.Fprintf(w, "# HELP sorotrail_chain_head_ledger Latest ledger from RPC\n")
+	fmt.Fprintf(w, "# TYPE sorotrail_chain_head_ledger gauge\n")
+	fmt.Fprintf(w, "sorotrail_chain_head_ledger %d\n", head)
+	fmt.Fprintf(w, "# HELP sorotrail_total_events Total number of events stored\n")
+	fmt.Fprintf(w, "# TYPE sorotrail_total_events gauge\n")
+	fmt.Fprintf(w, "sorotrail_total_events %d\n", stats.TotalEvents)
+	fmt.Fprintf(w, "# HELP sorotrail_contract_count Number of unique contracts with events\n")
+	fmt.Fprintf(w, "# TYPE sorotrail_contract_count gauge\n")
+	fmt.Fprintf(w, "sorotrail_contract_count %d\n", stats.ContractCount)
+	fmt.Fprintf(w, "# HELP sorotrail_watched_contracts Number of watched contracts\n")
+	fmt.Fprintf(w, "# TYPE sorotrail_watched_contracts gauge\n")
+	fmt.Fprintf(w, "sorotrail_watched_contracts %d\n", stats.WatchedContracts)
 }
