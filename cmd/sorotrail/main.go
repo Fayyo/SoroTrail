@@ -78,7 +78,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel)
+	log := newLogger(cfg.LogLevel, cfg.LogFormat)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -220,7 +220,7 @@ func run() error {
 	return firstErr
 }
 
-func newLogger(level string) *slog.Logger {
+func newLogger(level, format string) *slog.Logger {
 	var lvl slog.Level
 	switch strings.ToLower(level) {
 	case "debug":
@@ -232,5 +232,13 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+
+	var handler slog.Handler
+	switch strings.ToLower(format) {
+	case "json":
+		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
+	default:
+		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
+	}
+	return slog.New(handler)
 }

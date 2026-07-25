@@ -22,6 +22,7 @@ type Config struct {
 	StartLedger      uint32        `env:"START_LEDGER"`
 	RetentionLedgers uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
 	LogLevel         string        `env:"LOG_LEVEL" envDefault:"info"`
+	LogFormat        string        `env:"LOG_FORMAT" envDefault:"text"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
@@ -89,6 +90,11 @@ func (c Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("LOG_LEVEL %q is not one of debug|info|warn|error", c.LogLevel)
+	}
+	switch strings.ToLower(c.LogFormat) {
+	case "text", "json":
+	default:
+		return fmt.Errorf("LOG_FORMAT %q is not one of text|json", c.LogFormat)
 	}
 	for _, id := range c.WatchedContracts {
 		if !ValidContractID(id) {
