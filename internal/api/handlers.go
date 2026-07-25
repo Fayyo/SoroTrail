@@ -249,15 +249,13 @@ func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 	if s.rpc == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 
-	health, err := s.rpc.GetHealth(ctx)
+	// Use cached latest ledger to avoid hammering RPC on every /stats request
+	head, err := s.getCachedLatestLedger(ctx)
 	if err != nil {
 		s.log.Warn("loading RPC health for stats", "error", err)
 		return
 	}
-	head := int64(health.LatestLedger)
 	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
 	stats.ChainHeadLedger = &head
 	stats.IngestLagLedgers = &lag
